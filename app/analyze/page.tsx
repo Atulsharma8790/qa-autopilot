@@ -41,8 +41,10 @@ export default function AnalyzePage() {
   const [stepData, setStepData]        = useState<StepData>({})
   const [done, setDone]                = useState(false)
   const [error, setError]              = useState('')
-  const [activeTab, setActiveTab]      = useState(0)
   const [copied, setCopied]            = useState(false)
+
+  // Tab navigation: null = auto-follow active step, number = user pinned to this step
+  const [pinnedTab, setPinnedTab]      = useState<number | null>(null)
 
   // JIRA push state
   const [jiraCreds, setJiraCreds]      = useState<JiraCredentials>({ baseUrl: '', email: '', token: '', projectKey: '' })
@@ -52,17 +54,30 @@ export default function AnalyzePage() {
   const [pushResult, setPushResult]    = useState<{ created: PushedTicket[]; failed: FailedTicket[] } | null>(null)
   const [pushErr, setPushErr]          = useState('')
 
+  // Inline ticket editing
+  const [editingIdx, setEditingIdx]    = useState<number | null>(null)
+  const [editDrafts, setEditDrafts]    = useState<Record<number, JiraTicket>>({})
+
+  // Attachment upload
+  const [attachingKey, setAttachingKey]       = useState<string | null>(null)
+  const [attachUploading, setAttachUploading] = useState(false)
+  const [attachResults, setAttachResults]     = useState<Record<string, string[]>>({})
+  const [attachErr, setAttachErr]             = useState<Record<string, string>>({})
+  const attachFileRef = useRef<HTMLInputElement>(null)
+
   // Token streaming goes directly to DOM — no useState, no re-renders
-  const liveBoxRefs  = useRef<Record<number, HTMLPreElement | null>>({})
+  const liveBoxRefs   = useRef<Record<number, HTMLPreElement | null>>({})
   const liveTextAccum = useRef<Record<number, string>>({})
-  const abortRef     = useRef<AbortController | null>(null)
+  const sseBuffer     = useRef('')
+  const abortRef      = useRef<AbortController | null>(null)
+
+  // displayTab: follow active step unless user has pinned a tab
+  const displayTab = pinnedTab ?? activeStep
 
   useEffect(() => {
     const failures = sessionStorage.getItem('qa_failures')
     if (!failures) { router.push('/'); return }
     runLoop(failures)
-
-    // Load JIRA creds if user connected JIRA on the home page
     try {
       const saved = sessionStorage.getItem('qa_jira')
       if (saved) {
@@ -71,7 +86,6 @@ export default function AnalyzePage() {
         setJiraConnected(true)
       }
     } catch { /* ignore */ }
-
     return () => abortRef.current?.abort()
   }, [])
 
@@ -85,7 +99,6 @@ export default function AnalyzePage() {
     const data = await res.json()
     if (res.ok) {
       setPushResult({ created: data.created, failed: data.failed })
-      // Save creds for future sessions
       sessionStorage.setItem('qa_jira', JSON.stringify(creds))
       setJiraConnected(true)
     } else {
@@ -93,6 +106,27 @@ export default function AnalyzePage() {
     }
     setPushing(false)
   }, [])
+
+  async function attachToJira(issueKey: string, file: File) {
+    setAttachUploading(true)
+    setAttachErr(p => ({ ...p, [issueKey]: '' }))
+    const creds = jiraCreds
+    const form = new FormData()
+    form.append('baseUrl', creds.baseUrl)
+    form.append('email', creds.email)
+    form.append('token', creds.token)
+    form.append('issueKey', issueKey)
+    form.append('file', file)
+    const res = await fetch('/api/attach-jira', { method: 'POST', body: form })
+    const data = await res.json()
+    if (res.ok) {
+      setAttachResults(p => ({ ...p, [issueKey]: [...(p[issueKey] ?? []), data.filename] }))
+      setAttachingKey(null)
+    } else {
+      setAttachErr(p => ({ ...p, [issueKey]: data.error ?? 'Upload failed' }))
+    }
+    setAttachUploading(false)
+  }
 
   async function runLoop(failures: string) {
     abortRef.current = new AbortController()
@@ -111,16 +145,21 @@ export default function AnalyzePage() {
         const { done: streamDone, value } = await reader.read()
         if (streamDone) break
 
-        const lines = dec.decode(value).split('\n')
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
+        // Buffer to handle SSE messages split across chunks
+        sseBuffer.current += dec.decode(value, { stream: true })
+        const parts = sseBuffer.current.split('\n\n')
+        sseBuffer.current = parts.pop() ?? ''
+
+        for (const part of parts) {
+          const line = part.split('\n').find(l => l.startsWith('data: '))
+          if (!line) continue
           try {
             const data = JSON.parse(line.slice(6))
 
             if (data.type === 'step_start') {
               setActiveStep(data.step)
-              // Auto-follow: switch tab to the new active step
-              setActiveTab(data.step)
+              // Always auto-advance to the newly active step — clear any user pin
+              setPinnedTab(null)
             }
 
             if (data.type === 'token') {
@@ -143,7 +182,8 @@ export default function AnalyzePage() {
             if (data.type === 'complete') {
               setDone(true)
               setActiveStep(0)
-              setActiveTab(prev => prev === 0 ? 5 : prev)
+              // Land on Self-Review if user hasn't pinned somewhere specific
+              setPinnedTab(prev => prev !== null ? prev : 5)
             }
 
             if (data.type === 'error') setError(data.message)
@@ -153,6 +193,22 @@ export default function AnalyzePage() {
     } catch (e: unknown) {
       if ((e as Error).name !== 'AbortError') setError((e as Error).message)
     }
+  }
+
+  function saveTicketEdit(idx: number) {
+    const draft = editDrafts[idx]
+    if (!draft) return
+    setStepData(prev => {
+      const tickets = [...(prev[4] ?? [])] as JiraTicket[]
+      tickets[idx] = draft
+      return { ...prev, 4: tickets }
+    })
+    setEditingIdx(null)
+  }
+
+  function startEdit(idx: number, ticket: JiraTicket) {
+    setEditDrafts(p => ({ ...p, [idx]: { ...ticket, stepsToReproduce: [...ticket.stepsToReproduce] } }))
+    setEditingIdx(idx)
   }
 
   function exportMarkdown() {
@@ -179,14 +235,13 @@ export default function AnalyzePage() {
   }
 
   const s5 = stepData[5] as SelfReview | undefined
-  const displayTab = activeTab === 0 ? activeStep : activeTab
+  const step4NeedsAction = completedSteps.includes(4) && !pushResult
 
   // ── STEP CONTENT RENDERER ─────────────────────────────────────────────────
   function StepContent({ stepNum }: { stepNum: number }) {
     const isComplete = completedSteps.includes(stepNum)
     const isActive   = activeStep === stepNum
 
-    // Skeleton while waiting
     if (!isComplete && !isActive) {
       return (
         <div className="text-center py-16 text-slate-600">
@@ -196,7 +251,7 @@ export default function AnalyzePage() {
       )
     }
 
-    // Live stream while active — tokens written directly to DOM via ref, zero React re-renders
+    // Live stream — tokens written directly to DOM, zero React re-renders
     if (isActive && !isComplete) {
       return (
         <div>
@@ -216,7 +271,7 @@ export default function AnalyzePage() {
       )
     }
 
-    // Show parsed results once complete
+    // ── Step 1: Classifications ──
     if (stepNum === 1) {
       const data = stepData[1]
       if (!Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
@@ -243,6 +298,7 @@ export default function AnalyzePage() {
       )
     }
 
+    // ── Step 2: Root Causes ──
     if (stepNum === 2) {
       const data = stepData[2]
       if (!Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
@@ -268,6 +324,7 @@ export default function AnalyzePage() {
       )
     }
 
+    // ── Step 3: Clusters ──
     if (stepNum === 3) {
       const data = stepData[3]
       if (!Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
@@ -294,16 +351,28 @@ export default function AnalyzePage() {
       )
     }
 
+    // ── Step 4: JIRA Tickets ──
     if (stepNum === 4) {
       const data = stepData[4]
       if (!Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
+
       return (
         <div className="space-y-5 fade-slide-in">
 
-          {/* ── JIRA ACTION BANNER ── */}
+          {/* ── Action call-out ── */}
+          {!pushResult && (
+            <div className="flex items-center gap-3 bg-amber-500/10 border border-amber-500/40 rounded-2xl px-5 py-4">
+              <span className="text-2xl">⚡</span>
+              <div className="flex-1">
+                <p className="text-amber-400 font-black">Action required — {data.length} ticket{data.length !== 1 ? 's' : ''} ready to push</p>
+                <p className="text-slate-400 text-xs mt-0.5">Review and edit tickets below, then connect JIRA to create them with one click</p>
+              </div>
+            </div>
+          )}
+
+          {/* ── JIRA push banner ── */}
           <div className={`rounded-2xl border p-5 ${pushResult ? 'border-emerald-500/40 bg-emerald-500/5' : 'border-blue-500/30 bg-blue-500/5'}`}>
 
-            {/* Success state */}
             {pushResult && (
               <div>
                 <div className="flex items-center gap-3 mb-4">
@@ -334,7 +403,6 @@ export default function AnalyzePage() {
               </div>
             )}
 
-            {/* Ready to push — creds available */}
             {!pushResult && jiraConnected && !showJiraForm && (
               <div className="flex items-center justify-between gap-4 flex-wrap">
                 <div className="flex items-center gap-3">
@@ -343,7 +411,7 @@ export default function AnalyzePage() {
                     <p className="text-white font-bold">Push {data.length} ticket{data.length !== 1 ? 's' : ''} to JIRA</p>
                     <p className="text-slate-400 text-xs mt-0.5">
                       Connected to <span className="text-blue-400 font-mono">{jiraCreds.baseUrl}</span>
-                      {jiraCreds.projectKey && <> · Project: <span className="text-blue-400 font-mono">{jiraCreds.projectKey}</span></>}
+                      {jiraCreds.projectKey && <> · <span className="text-blue-400 font-mono">{jiraCreds.projectKey}</span></>}
                     </p>
                   </div>
                 </div>
@@ -353,23 +421,15 @@ export default function AnalyzePage() {
                       placeholder="Project key e.g. QA"
                       className="bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 w-40" />
                   )}
-                  <button onClick={() => setShowJiraForm(true)}
-                    className="text-slate-500 text-xs underline hover:text-slate-300 transition-colors">
-                    Change account
-                  </button>
-                  <button
-                    onClick={() => pushToJira(data, jiraCreds)}
-                    disabled={pushing || !jiraCreds.projectKey}
+                  <button onClick={() => setShowJiraForm(true)} className="text-slate-500 text-xs underline hover:text-slate-300 transition-colors">Change account</button>
+                  <button onClick={() => pushToJira(data, jiraCreds)} disabled={pushing || !jiraCreds.projectKey}
                     className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-black px-6 py-2.5 rounded-xl transition-colors flex items-center gap-2 whitespace-nowrap">
-                    {pushing
-                      ? <><span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full spin-slow" /> Creating tickets…</>
-                      : '🚀 Push to JIRA'}
+                    {pushing ? <><span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full spin-slow" /> Creating…</> : '🚀 Push to JIRA'}
                   </button>
                 </div>
               </div>
             )}
 
-            {/* Not connected — show connect form */}
             {!pushResult && (!jiraConnected || showJiraForm) && (
               <div>
                 <div className="flex items-center gap-2 mb-4">
@@ -380,27 +440,18 @@ export default function AnalyzePage() {
                   </div>
                 </div>
                 <div className="grid md:grid-cols-2 gap-3 mb-4">
-                  <JiraField label="JIRA Base URL *" value={jiraCreds.baseUrl}
-                    onChange={v => setJiraCreds(p => ({ ...p, baseUrl: v }))} placeholder="https://company.atlassian.net" />
-                  <JiraField label="Email *" value={jiraCreds.email}
-                    onChange={v => setJiraCreds(p => ({ ...p, email: v }))} placeholder="you@company.com" />
-                  <JiraField label="API Token *" value={jiraCreds.token}
-                    onChange={v => setJiraCreds(p => ({ ...p, token: v }))} placeholder="ATATT3x…" type="password" />
-                  <JiraField label="Project Key *" value={jiraCreds.projectKey}
-                    onChange={v => setJiraCreds(p => ({ ...p, projectKey: v }))} placeholder="QA" />
+                  <JiraField label="JIRA Base URL *" value={jiraCreds.baseUrl} onChange={v => setJiraCreds(p => ({ ...p, baseUrl: v }))} placeholder="https://company.atlassian.net" />
+                  <JiraField label="Email *" value={jiraCreds.email} onChange={v => setJiraCreds(p => ({ ...p, email: v }))} placeholder="you@company.com" />
+                  <JiraField label="API Token *" value={jiraCreds.token} onChange={v => setJiraCreds(p => ({ ...p, token: v }))} placeholder="ATATT3x…" type="password" />
+                  <JiraField label="Project Key *" value={jiraCreds.projectKey} onChange={v => setJiraCreds(p => ({ ...p, projectKey: v }))} placeholder="QA" />
                 </div>
                 <div className="flex items-center gap-3 flex-wrap">
                   {showJiraForm && <button onClick={() => setShowJiraForm(false)} className="text-slate-500 text-xs hover:text-slate-300 underline">Cancel</button>}
-                  <p className="text-slate-600 text-xs">
-                    Token: <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" className="text-blue-400 hover:underline">id.atlassian.com →</a>
-                  </p>
-                  <button
-                    onClick={() => pushToJira(data, jiraCreds)}
+                  <p className="text-slate-600 text-xs">Token: <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" className="text-blue-400 hover:underline">id.atlassian.com →</a></p>
+                  <button onClick={() => pushToJira(data, jiraCreds)}
                     disabled={pushing || !jiraCreds.baseUrl || !jiraCreds.email || !jiraCreds.token || !jiraCreds.projectKey}
                     className="ml-auto bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-black px-6 py-2.5 rounded-xl transition-colors flex items-center gap-2">
-                    {pushing
-                      ? <><span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full spin-slow" /> Creating…</>
-                      : `🚀 Create ${data.length} tickets in JIRA`}
+                    {pushing ? <><span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full spin-slow" /> Creating…</> : `🚀 Create ${data.length} tickets in JIRA`}
                   </button>
                 </div>
               </div>
@@ -409,13 +460,19 @@ export default function AnalyzePage() {
             {pushErr && <p className="mt-3 text-red-400 text-sm bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">{pushErr}</p>}
           </div>
 
-          {/* ── TICKET CARDS ── */}
-          <p className="text-slate-500 text-xs uppercase tracking-widest">Generated tickets ({data.length})</p>
+          {/* ── Ticket cards ── */}
+          <p className="text-slate-500 text-xs uppercase tracking-widest">Generated tickets ({data.length}) — click ✏️ to edit before pushing</p>
           {data.map((ticket, i) => {
-            const pushed = pushResult?.created.find(c => c.title === ticket.jiraTitle)
+            const pushed    = pushResult?.created.find(c => c.title === ticket.jiraTitle)
+            const isEditing = editingIdx === i
+            const draft     = editDrafts[i] ?? ticket
+            const files     = attachResults[pushed?.key ?? ''] ?? []
+
             return (
-              <div key={i} className={`bg-slate-900 border rounded-xl p-5 transition-all ${pushed ? 'border-emerald-500/40' : 'border-slate-800'}`}>
-                <div className="flex items-start justify-between gap-3 mb-4 flex-wrap">
+              <div key={i} className={`bg-slate-900 border rounded-xl transition-all ${pushed ? 'border-emerald-500/40' : isEditing ? 'border-blue-500/40' : 'border-slate-800'}`}>
+
+                {/* Card header */}
+                <div className="flex items-start justify-between gap-3 p-5 pb-3 flex-wrap">
                   <div className="flex items-center gap-2 flex-wrap">
                     {pushed && (
                       <a href={pushed.url} target="_blank" rel="noopener noreferrer"
@@ -423,32 +480,120 @@ export default function AnalyzePage() {
                         {pushed.key} ↗
                       </a>
                     )}
-                    <h3 className="text-white font-bold">{ticket.jiraTitle}</h3>
+                    {isEditing
+                      ? <input value={draft.jiraTitle} onChange={e => setEditDrafts(p => ({ ...p, [i]: { ...draft, jiraTitle: e.target.value } }))}
+                          className="bg-slate-800 border border-blue-500/50 rounded-lg px-3 py-1.5 text-white font-bold text-sm focus:outline-none w-full max-w-lg" />
+                      : <h3 className="text-white font-bold">{ticket.jiraTitle}</h3>
+                    }
                   </div>
-                  <div className="flex gap-2 shrink-0">
-                    <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-1 rounded">{ticket.type}</span>
-                    <span className={`text-xs font-bold px-2 py-1 rounded border ${SEV[ticket.severity] ?? SEV.medium}`}>{ticket.severity}</span>
+                  <div className="flex gap-2 items-center shrink-0">
+                    {isEditing ? (
+                      <>
+                        <select value={draft.severity} onChange={e => setEditDrafts(p => ({ ...p, [i]: { ...draft, severity: e.target.value } }))}
+                          className="bg-slate-800 border border-slate-600 rounded-lg px-2 py-1 text-xs text-white focus:outline-none">
+                          {['critical','high','medium','low'].map(s => <option key={s} value={s}>{s}</option>)}
+                        </select>
+                        <select value={draft.type} onChange={e => setEditDrafts(p => ({ ...p, [i]: { ...draft, type: e.target.value } }))}
+                          className="bg-slate-800 border border-slate-600 rounded-lg px-2 py-1 text-xs text-white focus:outline-none">
+                          {['Bug','Story','Task','Improvement'].map(t => <option key={t} value={t}>{t}</option>)}
+                        </select>
+                      </>
+                    ) : (
+                      <>
+                        <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-1 rounded">{ticket.type}</span>
+                        <span className={`text-xs font-bold px-2 py-1 rounded border ${SEV[ticket.severity] ?? SEV.medium}`}>{ticket.severity}</span>
+                      </>
+                    )}
+                    {!pushed && (
+                      isEditing
+                        ? <>
+                            <button onClick={() => saveTicketEdit(i)} className="text-xs bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1 rounded-lg transition-colors">Save</button>
+                            <button onClick={() => setEditingIdx(null)} className="text-xs text-slate-500 hover:text-slate-300 transition-colors">Cancel</button>
+                          </>
+                        : <button onClick={() => startEdit(i, ticket)} className="text-xs text-slate-500 hover:text-blue-400 transition-colors px-2 py-1 rounded hover:bg-blue-500/10">✏️ Edit</button>
+                    )}
                   </div>
                 </div>
-                <div className="grid md:grid-cols-2 gap-4">
+
+                {/* Card body */}
+                <div className="grid md:grid-cols-2 gap-4 px-5 pb-4">
                   <div>
                     <p className="text-slate-500 text-xs mb-2 uppercase tracking-widest">Steps to Reproduce</p>
-                    <ol className="space-y-1">
-                      {ticket.stepsToReproduce?.map((step, j) => (
-                        <li key={j} className="text-slate-300 text-sm flex gap-2">
-                          <span className="text-slate-600 shrink-0">{j + 1}.</span>{step}
-                        </li>
-                      ))}
-                    </ol>
+                    {isEditing ? (
+                      <div className="space-y-1">
+                        {draft.stepsToReproduce?.map((step, j) => (
+                          <div key={j} className="flex gap-2 items-start">
+                            <span className="text-slate-600 text-sm shrink-0 mt-2">{j + 1}.</span>
+                            <input value={step} onChange={e => {
+                              const steps = [...draft.stepsToReproduce]
+                              steps[j] = e.target.value
+                              setEditDrafts(p => ({ ...p, [i]: { ...draft, stepsToReproduce: steps } }))
+                            }} className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500" />
+                          </div>
+                        ))}
+                        <button onClick={() => setEditDrafts(p => ({ ...p, [i]: { ...draft, stepsToReproduce: [...draft.stepsToReproduce, ''] } }))}
+                          className="text-xs text-slate-600 hover:text-slate-400 mt-1">+ Add step</button>
+                      </div>
+                    ) : (
+                      <ol className="space-y-1">
+                        {ticket.stepsToReproduce?.map((step, j) => (
+                          <li key={j} className="text-slate-300 text-sm flex gap-2">
+                            <span className="text-slate-600 shrink-0">{j + 1}.</span>{step}
+                          </li>
+                        ))}
+                      </ol>
+                    )}
                   </div>
                   <div className="space-y-3">
-                    <div><p className="text-slate-500 text-xs mb-1">Expected</p><p className="text-emerald-400 text-sm">{ticket.expectedBehaviour}</p></div>
-                    <div><p className="text-slate-500 text-xs mb-1">Actual</p><p className="text-red-400 text-sm">{ticket.actualBehaviour}</p></div>
-                    <div><p className="text-slate-500 text-xs mb-1">Suggested Fix</p><p className="text-slate-300 text-sm">{ticket.suggestedFix}</p></div>
+                    <EditableField label="Expected" value={isEditing ? draft.expectedBehaviour : ticket.expectedBehaviour} color="text-emerald-400"
+                      editing={isEditing} onChange={v => setEditDrafts(p => ({ ...p, [i]: { ...draft, expectedBehaviour: v } }))} />
+                    <EditableField label="Actual" value={isEditing ? draft.actualBehaviour : ticket.actualBehaviour} color="text-red-400"
+                      editing={isEditing} onChange={v => setEditDrafts(p => ({ ...p, [i]: { ...draft, actualBehaviour: v } }))} />
+                    <EditableField label="Suggested Fix" value={isEditing ? draft.suggestedFix : ticket.suggestedFix} color="text-slate-300"
+                      editing={isEditing} onChange={v => setEditDrafts(p => ({ ...p, [i]: { ...draft, suggestedFix: v } }))} />
                   </div>
                 </div>
-                <div className="mt-4 flex flex-wrap gap-2">
-                  {ticket.labels?.map((l, j) => <span key={j} className="text-xs bg-slate-800 text-slate-400 px-2 py-1 rounded-full">{l}</span>)}
+
+                {/* Labels + attachment row */}
+                <div className="px-5 pb-4 flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex flex-wrap gap-2">
+                    {ticket.labels?.map((l, j) => <span key={j} className="text-xs bg-slate-800 text-slate-400 px-2 py-1 rounded-full">{l}</span>)}
+                  </div>
+
+                  {/* Attachment controls — only after JIRA push */}
+                  {pushed && (
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {files.length > 0 && (
+                        <div className="flex gap-1 flex-wrap">
+                          {files.map((f, j) => (
+                            <span key={j} className="text-xs bg-slate-800 border border-slate-700 text-slate-400 px-2 py-1 rounded flex items-center gap-1">
+                              📎 {f}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {attachErr[pushed.key] && <span className="text-xs text-red-400">{attachErr[pushed.key]}</span>}
+                      {attachingKey === pushed.key ? (
+                        <div className="flex items-center gap-2">
+                          <input ref={attachFileRef} type="file" className="hidden" onChange={e => {
+                            const file = e.target.files?.[0]
+                            if (file) attachToJira(pushed.key, file)
+                            e.target.value = ''
+                          }} />
+                          <button onClick={() => attachFileRef.current?.click()} disabled={attachUploading}
+                            className="text-xs bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1">
+                            {attachUploading ? <><span className="inline-block w-3 h-3 border border-white/30 border-t-white rounded-full spin-slow" /> Uploading…</> : '📂 Choose file'}
+                          </button>
+                          <button onClick={() => setAttachingKey(null)} className="text-xs text-slate-600 hover:text-slate-400">✕</button>
+                        </div>
+                      ) : (
+                        <button onClick={() => setAttachingKey(pushed.key)}
+                          className="text-xs text-slate-500 hover:text-blue-400 px-2 py-1 rounded hover:bg-blue-500/10 transition-colors flex items-center gap-1">
+                          📎 Attach file
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             )
@@ -457,6 +602,7 @@ export default function AnalyzePage() {
       )
     }
 
+    // ── Step 5: Self-Review ──
     if (stepNum === 5) {
       const data = stepData[5] as SelfReview | undefined
       if (!data || typeof data !== 'object' || Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
@@ -514,6 +660,21 @@ export default function AnalyzePage() {
     )
   }
 
+  function EditableField({ label, value, color, editing, onChange }: {
+    label: string; value: string; color: string; editing: boolean; onChange: (v: string) => void
+  }) {
+    return (
+      <div>
+        <p className="text-slate-500 text-xs mb-1">{label}</p>
+        {editing
+          ? <textarea value={value} onChange={e => onChange(e.target.value)} rows={2}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500 resize-none" />
+          : <p className={`text-sm ${color}`}>{value}</p>
+        }
+      </div>
+    )
+  }
+
   return (
     <div className="min-h-screen flex flex-col">
       <header className="border-b border-slate-800 px-6 py-4 flex items-center justify-between">
@@ -527,7 +688,6 @@ export default function AnalyzePage() {
 
       <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-8">
 
-        {/* Summary bar — shown as soon as step 5 is done */}
         {s5 && (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 fade-slide-in">
             {[
@@ -546,38 +706,47 @@ export default function AnalyzePage() {
 
         {error && <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-6 text-red-400">{error}</div>}
 
-        {/* Step cards + content panel */}
         <div className="grid md:grid-cols-[260px_1fr] gap-5">
 
-          {/* Left: step tracker cards */}
+          {/* Left: step tracker */}
           <div className="space-y-2">
             {LOOP_STEPS.map(step => {
               const isComplete = completedSteps.includes(step.id)
               const isActive   = activeStep === step.id
               const isSelected = displayTab === step.id
+              const needsAction = step.id === 4 && step4NeedsAction
 
               return (
                 <button
                   key={step.id}
-                  onClick={() => setActiveTab(step.id)}
+                  onClick={() => setPinnedTab(step.id)}
                   className={`w-full text-left rounded-xl border p-4 transition-all ${
-                    isSelected  ? 'border-rose-500/60 bg-rose-500/10 shadow-lg shadow-rose-500/10' :
-                    isComplete  ? 'border-emerald-500/30 bg-emerald-500/5 hover:border-emerald-500/50 cursor-pointer' :
-                    isActive    ? 'border-rose-500/40 bg-rose-500/5 pulse-ring cursor-default' :
-                                  'border-slate-800 bg-slate-900/50 opacity-40 cursor-default'
+                    isSelected   ? 'border-rose-500/60 bg-rose-500/10 shadow-lg shadow-rose-500/10' :
+                    needsAction  ? 'border-amber-500/50 bg-amber-500/5 hover:border-amber-500/70 cursor-pointer' :
+                    isComplete   ? 'border-emerald-500/30 bg-emerald-500/5 hover:border-emerald-500/50 cursor-pointer' :
+                    isActive     ? 'border-rose-500/40 bg-rose-500/5 pulse-ring cursor-default' :
+                                   'border-slate-800 bg-slate-900/50 opacity-40 cursor-default'
                   }`}
                 >
                   <div className="flex items-center gap-3 mb-1">
                     <span className={`text-xl ${isActive && !isComplete ? 'spin-slow inline-block' : ''}`}>{step.icon}</span>
                     <span className="text-sm font-bold text-white">{step.label}</span>
                     <span className="ml-auto text-xs">
-                      {isComplete ? <span className="text-emerald-400">✓ Done</span> :
-                       isActive   ? <span className="text-rose-400 blink">● Live</span> :
-                                    <span className="text-slate-700">Pending</span>}
+                      {needsAction && !isSelected
+                        ? <span className="text-amber-400 font-bold blink">⚡ Action</span>
+                        : isComplete
+                          ? <span className="text-emerald-400">✓ Done</span>
+                          : isActive
+                            ? <span className="text-rose-400 blink">● Live</span>
+                            : <span className="text-slate-700">Pending</span>
+                      }
                     </span>
                   </div>
                   <p className="text-slate-500 text-xs leading-tight">{step.description}</p>
-                  {isComplete && !isSelected && (
+                  {needsAction && !isSelected && (
+                    <p className="text-amber-600 text-xs mt-2">Click to review & push to JIRA →</p>
+                  )}
+                  {isComplete && !needsAction && !isSelected && (
                     <p className="text-emerald-600 text-xs mt-2">Click to view results →</p>
                   )}
                 </button>
@@ -611,7 +780,11 @@ export default function AnalyzePage() {
                     <h2 className="font-bold text-white">Step {displayTab} — {LOOP_STEPS[displayTab - 1]?.label}</h2>
                     <p className="text-slate-500 text-xs">{LOOP_STEPS[displayTab - 1]?.description}</p>
                   </div>
-                  {completedSteps.includes(displayTab) && <span className="ml-auto text-emerald-400 text-sm font-bold">✓ Complete</span>}
+                  {displayTab === 4 && step4NeedsAction && (
+                    <span className="ml-auto text-amber-400 text-sm font-bold blink">⚡ Action Needed</span>
+                  )}
+                  {completedSteps.includes(displayTab) && displayTab !== 4 && <span className="ml-auto text-emerald-400 text-sm font-bold">✓ Complete</span>}
+                  {displayTab === 4 && completedSteps.includes(4) && !step4NeedsAction && <span className="ml-auto text-emerald-400 text-sm font-bold">✓ Pushed</span>}
                   {activeStep === displayTab && !completedSteps.includes(displayTab) && <span className="ml-auto text-rose-400 text-sm font-bold blink">● Running</span>}
                 </div>
                 <StepContent stepNum={displayTab} />
