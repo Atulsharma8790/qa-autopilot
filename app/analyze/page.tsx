@@ -222,7 +222,7 @@ export default function AnalyzePage() {
             </div>
 
             {/* Step 1 — Classifications */}
-            {activeTab === 1 && steps.step1 && (
+            {activeTab === 1 && Array.isArray(steps.step1) && (
               <div className="space-y-2">
                 {steps.step1.map((item, i) => (
                   <div key={i} className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-start gap-4">
@@ -240,7 +240,7 @@ export default function AnalyzePage() {
             )}
 
             {/* Step 2 — Root Causes */}
-            {activeTab === 2 && steps.step2 && (
+            {activeTab === 2 && Array.isArray(steps.step2) && (
               <div className="space-y-3">
                 {steps.step2.map((item, i) => (
                   <div key={i} className="bg-slate-900 border border-slate-800 rounded-xl p-5">
@@ -262,7 +262,7 @@ export default function AnalyzePage() {
             )}
 
             {/* Step 3 — Clusters */}
-            {activeTab === 3 && steps.step3 && (
+            {activeTab === 3 && Array.isArray(steps.step3) && (
               <div className="space-y-3">
                 {steps.step3.map((cluster, i) => (
                   <div key={i} className="bg-slate-900 border border-slate-800 rounded-xl p-5">
@@ -287,7 +287,7 @@ export default function AnalyzePage() {
             )}
 
             {/* Step 4 — JIRA Tickets */}
-            {activeTab === 4 && steps.step4 && (
+            {activeTab === 4 && Array.isArray(steps.step4) && (
               <div className="space-y-4">
                 {steps.step4.map((ticket, i) => (
                   <div key={i} className="bg-slate-900 border border-slate-800 rounded-xl p-6">

@@ -10,6 +10,73 @@ function send(controller: ReadableStreamDefaultController, data: object) {
   controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`))
 }
 
+/** Robustly extract an array from a JSON chunk — handles wrapped objects too */
+function extractArray(chunk: string): unknown[] | null {
+  // Try direct array first
+  const arrMatch = chunk.match(/\[[\s\S]*\]/)
+  if (arrMatch) {
+    try {
+      const parsed = JSON.parse(arrMatch[0])
+      if (Array.isArray(parsed)) return parsed
+    } catch { /* continue */ }
+  }
+  // Try object with any array-valued key
+  const objMatch = chunk.match(/\{[\s\S]*\}/)
+  if (objMatch) {
+    try {
+      const parsed = JSON.parse(objMatch[0])
+      if (parsed && typeof parsed === 'object') {
+        for (const val of Object.values(parsed)) {
+          if (Array.isArray(val)) return val
+        }
+      }
+    } catch { /* continue */ }
+  }
+  return null
+}
+
+/** Robustly extract an object from a JSON chunk */
+function extractObject(chunk: string): Record<string, unknown> | null {
+  const objMatch = chunk.match(/\{[\s\S]*\}/)
+  if (objMatch) {
+    try {
+      const parsed = JSON.parse(objMatch[0])
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+    } catch { /* continue */ }
+  }
+  return null
+}
+
+function parseSteps(text: string): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+  const stepKeys = ['STEP_1', 'STEP_2', 'STEP_3', 'STEP_4', 'STEP_5']
+
+  for (let i = 0; i < stepKeys.length; i++) {
+    const startMarker = `${stepKeys[i]}_START`
+    const nextMarker  = i < stepKeys.length - 1 ? `${stepKeys[i + 1]}_START` : null
+
+    const startIdx = text.indexOf(startMarker)
+    if (startIdx === -1) continue
+
+    const chunk = nextMarker && text.indexOf(nextMarker) !== -1
+      ? text.slice(startIdx + startMarker.length, text.indexOf(nextMarker))
+      : text.slice(startIdx + startMarker.length)
+
+    const key = `step${i + 1}`
+
+    if (i < 4) {
+      // Steps 1–4 expect arrays
+      const arr = extractArray(chunk)
+      if (arr) { result[key] = arr; continue }
+    }
+    // Step 5 (or fallback) expects an object
+    const obj = extractObject(chunk)
+    if (obj) result[key] = obj
+  }
+
+  return result
+}
+
 export async function POST(req: Request) {
   const { failures } = await req.json()
   if (!failures?.trim()) {
@@ -36,10 +103,9 @@ export async function POST(req: Request) {
             const text = chunk.delta.text
             fullText += text
 
-            // Detect step transitions
-            const stepMatch = fullText.match(/STEP_(\d)_START/)
+            const stepMatch = fullText.match(/STEP_(\d)_START/g)
             if (stepMatch) {
-              const stepNum = parseInt(stepMatch[1])
+              const stepNum = parseInt(stepMatch[stepMatch.length - 1].replace('STEP_', '').replace('_START', ''))
               if (stepNum !== currentStep) {
                 currentStep = stepNum
                 send(controller, { type: 'step_start', step: currentStep })
@@ -50,7 +116,6 @@ export async function POST(req: Request) {
           }
         }
 
-        // Parse and emit structured results per step
         const steps = parseSteps(fullText)
         send(controller, { type: 'complete', steps })
 
@@ -70,33 +135,4 @@ export async function POST(req: Request) {
       Connection: 'keep-alive',
     },
   })
-}
-
-function parseSteps(text: string): Record<string, unknown> {
-  const result: Record<string, unknown> = {}
-  const stepKeys = ['STEP_1', 'STEP_2', 'STEP_3', 'STEP_4', 'STEP_5']
-
-  for (let i = 0; i < stepKeys.length; i++) {
-    const startMarker = `${stepKeys[i]}_START`
-    const endMarker   = i < stepKeys.length - 1 ? `${stepKeys[i + 1]}_START` : null
-
-    const startIdx = text.indexOf(startMarker)
-    if (startIdx === -1) continue
-
-    const chunk = endMarker
-      ? text.slice(startIdx + startMarker.length, text.indexOf(endMarker))
-      : text.slice(startIdx + startMarker.length)
-
-    // Extract JSON from chunk
-    const jsonMatch = chunk.match(/(\[[\s\S]*\]|\{[\s\S]*\})/)
-    if (jsonMatch) {
-      try {
-        result[`step${i + 1}`] = JSON.parse(jsonMatch[0])
-      } catch {
-        result[`step${i + 1}`] = { raw: chunk.trim().slice(0, 500) }
-      }
-    }
-  }
-
-  return result
 }
