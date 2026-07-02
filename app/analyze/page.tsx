@@ -39,10 +39,9 @@ export default function AnalyzePage() {
   const [activeStep, setActiveStep]    = useState(0)
   const [completedSteps, setCompleted] = useState<number[]>([])
   const [stepData, setStepData]        = useState<StepData>({})
-  const [liveTokens, setLiveTokens]    = useState<Record<number, string>>({})
   const [done, setDone]                = useState(false)
   const [error, setError]              = useState('')
-  const [activeTab, setActiveTab]      = useState(0)  // 0 = follow active step
+  const [activeTab, setActiveTab]      = useState(0)
   const [copied, setCopied]            = useState(false)
 
   // JIRA push state
@@ -53,8 +52,10 @@ export default function AnalyzePage() {
   const [pushResult, setPushResult]    = useState<{ created: PushedTicket[]; failed: FailedTicket[] } | null>(null)
   const [pushErr, setPushErr]          = useState('')
 
-  const liveRef = useRef<HTMLDivElement>(null)
-  const abortRef = useRef<AbortController | null>(null)
+  // Token streaming goes directly to DOM — no useState, no re-renders
+  const liveBoxRefs  = useRef<Record<number, HTMLPreElement | null>>({})
+  const liveTextAccum = useRef<Record<number, string>>({})
+  const abortRef     = useRef<AbortController | null>(null)
 
   useEffect(() => {
     const failures = sessionStorage.getItem('qa_failures')
@@ -93,11 +94,6 @@ export default function AnalyzePage() {
     setPushing(false)
   }, [])
 
-  // Auto-scroll live output
-  useEffect(() => {
-    if (liveRef.current) liveRef.current.scrollTop = liveRef.current.scrollHeight
-  }, [liveTokens])
-
   async function runLoop(failures: string) {
     abortRef.current = new AbortController()
     try {
@@ -129,7 +125,13 @@ export default function AnalyzePage() {
 
             if (data.type === 'token') {
               const s = data.step ?? 0
-              setLiveTokens(prev => ({ ...prev, [s]: (prev[s] ?? '') + data.text }))
+              liveTextAccum.current[s] = (liveTextAccum.current[s] ?? '') + data.text
+              const el = liveBoxRefs.current[s]
+              if (el) {
+                el.textContent += data.text
+                const container = el.parentElement
+                if (container) container.scrollTop = container.scrollHeight
+              }
             }
 
             if (data.type === 'step_result') {
@@ -183,7 +185,6 @@ export default function AnalyzePage() {
   function StepContent({ stepNum }: { stepNum: number }) {
     const isComplete = completedSteps.includes(stepNum)
     const isActive   = activeStep === stepNum
-    const tokens     = liveTokens[stepNum] ?? ''
 
     // Skeleton while waiting
     if (!isComplete && !isActive) {
@@ -195,7 +196,7 @@ export default function AnalyzePage() {
       )
     }
 
-    // Live stream while active
+    // Live stream while active — tokens written directly to DOM via ref, zero React re-renders
     if (isActive && !isComplete) {
       return (
         <div>
@@ -203,8 +204,11 @@ export default function AnalyzePage() {
             <span className="inline-block w-3 h-3 rounded-full bg-rose-500 blink" />
             <span className="text-rose-400 font-bold text-sm">Agent is working on this step...</span>
           </div>
-          <div ref={liveRef} className="bg-slate-800 border border-slate-700 rounded-xl p-4 h-64 overflow-y-auto font-mono text-xs text-slate-300 whitespace-pre-wrap leading-relaxed">
-            {tokens || <span className="text-slate-600">Starting...</span>}
+          <div className="bg-slate-800 border border-slate-700 rounded-xl p-4 h-64 overflow-y-auto">
+            <pre
+              ref={el => { liveBoxRefs.current[stepNum] = el }}
+              className="font-mono text-xs text-slate-300 whitespace-pre-wrap leading-relaxed"
+            />
             <span className="inline-block w-2 h-4 bg-rose-500 blink ml-0.5 align-text-bottom" />
           </div>
           <p className="text-slate-600 text-xs mt-2">Live output from Claude — structured results appear when this step completes</p>
@@ -215,7 +219,7 @@ export default function AnalyzePage() {
     // Show parsed results once complete
     if (stepNum === 1) {
       const data = stepData[1]
-      if (!Array.isArray(data)) return <RawFallback tokens={tokens} />
+      if (!Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
       return (
         <div className="space-y-2 fade-slide-in">
           <div className="flex gap-3 mb-4 flex-wrap">
@@ -241,7 +245,7 @@ export default function AnalyzePage() {
 
     if (stepNum === 2) {
       const data = stepData[2]
-      if (!Array.isArray(data)) return <RawFallback tokens={tokens} />
+      if (!Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
       return (
         <div className="space-y-3 fade-slide-in">
           {data.map((item, i) => (
@@ -266,7 +270,7 @@ export default function AnalyzePage() {
 
     if (stepNum === 3) {
       const data = stepData[3]
-      if (!Array.isArray(data)) return <RawFallback tokens={tokens} />
+      if (!Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
       return (
         <div className="space-y-3 fade-slide-in">
           {data.map((cluster, i) => (
@@ -292,7 +296,7 @@ export default function AnalyzePage() {
 
     if (stepNum === 4) {
       const data = stepData[4]
-      if (!Array.isArray(data)) return <RawFallback tokens={tokens} />
+      if (!Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
       return (
         <div className="space-y-5 fade-slide-in">
 
@@ -455,7 +459,7 @@ export default function AnalyzePage() {
 
     if (stepNum === 5) {
       const data = stepData[5] as SelfReview | undefined
-      if (!data || typeof data !== 'object' || Array.isArray(data)) return <RawFallback tokens={tokens} />
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return <RawFallback tokens={liveTextAccum.current[stepNum] ?? ''} />
       return (
         <div className="space-y-4 fade-slide-in">
           <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-full font-bold ${
