@@ -104,6 +104,10 @@ export default function Home() {
     if (res.ok) {
       setEnrichContent(prev => ({ ...prev, [source]: data.content }))
       setEnrichMeta(prev => ({ ...prev, [source]: JSON.stringify(data.meta ?? {}) }))
+      // Save JIRA credentials for use in the analyzer's Push-to-JIRA feature
+      if (source === 'jira') {
+        sessionStorage.setItem('qa_jira', JSON.stringify({ baseUrl: jiraUrl, email: jiraEmail, token: jiraToken, projectKey: jiraProject }))
+      }
     } else {
       setEnrichErr(prev => ({ ...prev, [source]: data.error ?? `${source} fetch failed` }))
     }

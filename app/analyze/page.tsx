@@ -1,7 +1,11 @@
 'use client'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { LOOP_STEPS } from '@/lib/prompts'
+
+type JiraCredentials = { baseUrl: string; email: string; token: string; projectKey: string }
+type PushedTicket    = { key: string; url: string; title: string }
+type FailedTicket    = { title: string; error: string }
 
 type Classification = { testName: string; classification: string; confidence: string; reason: string }
 type RootCause      = { testName: string; hypothesis: string; evidence: string; affectedArea: string }
@@ -40,6 +44,15 @@ export default function AnalyzePage() {
   const [error, setError]              = useState('')
   const [activeTab, setActiveTab]      = useState(0)  // 0 = follow active step
   const [copied, setCopied]            = useState(false)
+
+  // JIRA push state
+  const [jiraCreds, setJiraCreds]      = useState<JiraCredentials>({ baseUrl: '', email: '', token: '', projectKey: '' })
+  const [jiraConnected, setJiraConnected] = useState(false)
+  const [showJiraForm, setShowJiraForm]   = useState(false)
+  const [pushing, setPushing]          = useState(false)
+  const [pushResult, setPushResult]    = useState<{ created: PushedTicket[]; failed: FailedTicket[] } | null>(null)
+  const [pushErr, setPushErr]          = useState('')
+
   const liveRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
@@ -47,7 +60,37 @@ export default function AnalyzePage() {
     const failures = sessionStorage.getItem('qa_failures')
     if (!failures) { router.push('/'); return }
     runLoop(failures)
+
+    // Load JIRA creds if user connected JIRA on the home page
+    try {
+      const saved = sessionStorage.getItem('qa_jira')
+      if (saved) {
+        const creds = JSON.parse(saved) as JiraCredentials
+        setJiraCreds(creds)
+        setJiraConnected(true)
+      }
+    } catch { /* ignore */ }
+
     return () => abortRef.current?.abort()
+  }, [])
+
+  const pushToJira = useCallback(async (tickets: JiraTicket[], creds: JiraCredentials) => {
+    setPushing(true); setPushErr(''); setPushResult(null)
+    const res = await fetch('/api/push-jira', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...creds, tickets }),
+    })
+    const data = await res.json()
+    if (res.ok) {
+      setPushResult({ created: data.created, failed: data.failed })
+      // Save creds for future sessions
+      sessionStorage.setItem('qa_jira', JSON.stringify(creds))
+      setJiraConnected(true)
+    } else {
+      setPushErr(data.error ?? 'Push failed')
+    }
+    setPushing(false)
   }, [])
 
   // Auto-scroll live output
@@ -251,36 +294,161 @@ export default function AnalyzePage() {
       const data = stepData[4]
       if (!Array.isArray(data)) return <RawFallback tokens={tokens} />
       return (
-        <div className="space-y-4 fade-slide-in">
-          {data.map((ticket, i) => (
-            <div key={i} className="bg-slate-900 border border-slate-800 rounded-xl p-6">
-              <div className="flex items-start justify-between gap-4 mb-4">
-                <h3 className="text-white font-bold text-lg">{ticket.jiraTitle}</h3>
-                <div className="flex gap-2 shrink-0">
-                  <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-1 rounded">{ticket.type}</span>
-                  <span className={`text-xs font-bold px-2 py-1 rounded border ${SEV[ticket.severity] ?? SEV.medium}`}>{ticket.severity}</span>
+        <div className="space-y-5 fade-slide-in">
+
+          {/* ── JIRA ACTION BANNER ── */}
+          <div className={`rounded-2xl border p-5 ${pushResult ? 'border-emerald-500/40 bg-emerald-500/5' : 'border-blue-500/30 bg-blue-500/5'}`}>
+
+            {/* Success state */}
+            {pushResult && (
+              <div>
+                <div className="flex items-center gap-3 mb-4">
+                  <span className="text-2xl">🎉</span>
+                  <div>
+                    <p className="text-emerald-400 font-black text-lg">{pushResult.created.length} ticket{pushResult.created.length !== 1 ? 's' : ''} created in JIRA</p>
+                    {pushResult.failed.length > 0 && <p className="text-yellow-400 text-sm">{pushResult.failed.length} failed</p>}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {pushResult.created.map(t => (
+                    <a key={t.key} href={t.url} target="_blank" rel="noopener noreferrer"
+                      className="flex items-center gap-1.5 bg-blue-500/20 border border-blue-500/40 text-blue-400 hover:text-blue-300 px-3 py-1.5 rounded-lg text-sm font-mono font-bold transition-colors">
+                      🎯 {t.key} <span className="text-xs opacity-70">↗</span>
+                    </a>
+                  ))}
+                </div>
+                {pushResult.failed.length > 0 && (
+                  <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3">
+                    <p className="text-yellow-400 text-xs font-bold mb-1">Failed tickets:</p>
+                    {pushResult.failed.map((f, i) => <p key={i} className="text-slate-400 text-xs">{f.title} — {f.error}</p>)}
+                  </div>
+                )}
+                <button onClick={() => { setPushResult(null); setPushErr('') }}
+                  className="mt-3 text-slate-500 hover:text-slate-300 text-xs underline transition-colors">
+                  Push again / use different project
+                </button>
+              </div>
+            )}
+
+            {/* Ready to push — creds available */}
+            {!pushResult && jiraConnected && !showJiraForm && (
+              <div className="flex items-center justify-between gap-4 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <span className="text-2xl">🎯</span>
+                  <div>
+                    <p className="text-white font-bold">Push {data.length} ticket{data.length !== 1 ? 's' : ''} to JIRA</p>
+                    <p className="text-slate-400 text-xs mt-0.5">
+                      Connected to <span className="text-blue-400 font-mono">{jiraCreds.baseUrl}</span>
+                      {jiraCreds.projectKey && <> · Project: <span className="text-blue-400 font-mono">{jiraCreds.projectKey}</span></>}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                  {!jiraCreds.projectKey && (
+                    <input value={jiraCreds.projectKey} onChange={e => setJiraCreds(p => ({ ...p, projectKey: e.target.value }))}
+                      placeholder="Project key e.g. QA"
+                      className="bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 w-40" />
+                  )}
+                  <button onClick={() => setShowJiraForm(true)}
+                    className="text-slate-500 text-xs underline hover:text-slate-300 transition-colors">
+                    Change account
+                  </button>
+                  <button
+                    onClick={() => pushToJira(data, jiraCreds)}
+                    disabled={pushing || !jiraCreds.projectKey}
+                    className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-black px-6 py-2.5 rounded-xl transition-colors flex items-center gap-2 whitespace-nowrap">
+                    {pushing
+                      ? <><span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full spin-slow" /> Creating tickets…</>
+                      : '🚀 Push to JIRA'}
+                  </button>
                 </div>
               </div>
-              <div className="grid md:grid-cols-2 gap-4">
-                <div>
-                  <p className="text-slate-500 text-xs mb-2 uppercase tracking-widest">Steps to Reproduce</p>
-                  <ol className="space-y-1">
-                    {ticket.stepsToReproduce?.map((step, j) => (
-                      <li key={j} className="text-slate-300 text-sm flex gap-2"><span className="text-slate-600 shrink-0">{j + 1}.</span>{step}</li>
-                    ))}
-                  </ol>
+            )}
+
+            {/* Not connected — show connect form */}
+            {!pushResult && (!jiraConnected || showJiraForm) && (
+              <div>
+                <div className="flex items-center gap-2 mb-4">
+                  <span className="text-xl">🎯</span>
+                  <div>
+                    <p className="text-white font-bold">Push tickets directly to JIRA</p>
+                    <p className="text-slate-400 text-xs">Connect your JIRA account to create all {data.length} tickets with one click</p>
+                  </div>
                 </div>
-                <div className="space-y-3">
-                  <div><p className="text-slate-500 text-xs mb-1">Expected</p><p className="text-emerald-400 text-sm">{ticket.expectedBehaviour}</p></div>
-                  <div><p className="text-slate-500 text-xs mb-1">Actual</p><p className="text-red-400 text-sm">{ticket.actualBehaviour}</p></div>
-                  <div><p className="text-slate-500 text-xs mb-1">Suggested Fix</p><p className="text-slate-300 text-sm">{ticket.suggestedFix}</p></div>
+                <div className="grid md:grid-cols-2 gap-3 mb-4">
+                  <JiraField label="JIRA Base URL *" value={jiraCreds.baseUrl}
+                    onChange={v => setJiraCreds(p => ({ ...p, baseUrl: v }))} placeholder="https://company.atlassian.net" />
+                  <JiraField label="Email *" value={jiraCreds.email}
+                    onChange={v => setJiraCreds(p => ({ ...p, email: v }))} placeholder="you@company.com" />
+                  <JiraField label="API Token *" value={jiraCreds.token}
+                    onChange={v => setJiraCreds(p => ({ ...p, token: v }))} placeholder="ATATT3x…" type="password" />
+                  <JiraField label="Project Key *" value={jiraCreds.projectKey}
+                    onChange={v => setJiraCreds(p => ({ ...p, projectKey: v }))} placeholder="QA" />
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                  {showJiraForm && <button onClick={() => setShowJiraForm(false)} className="text-slate-500 text-xs hover:text-slate-300 underline">Cancel</button>}
+                  <p className="text-slate-600 text-xs">
+                    Token: <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" className="text-blue-400 hover:underline">id.atlassian.com →</a>
+                  </p>
+                  <button
+                    onClick={() => pushToJira(data, jiraCreds)}
+                    disabled={pushing || !jiraCreds.baseUrl || !jiraCreds.email || !jiraCreds.token || !jiraCreds.projectKey}
+                    className="ml-auto bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-black px-6 py-2.5 rounded-xl transition-colors flex items-center gap-2">
+                    {pushing
+                      ? <><span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full spin-slow" /> Creating…</>
+                      : `🚀 Create ${data.length} tickets in JIRA`}
+                  </button>
                 </div>
               </div>
-              <div className="mt-4 flex flex-wrap gap-2">
-                {ticket.labels?.map((l, j) => <span key={j} className="text-xs bg-slate-800 text-slate-400 px-2 py-1 rounded-full">{l}</span>)}
+            )}
+
+            {pushErr && <p className="mt-3 text-red-400 text-sm bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">{pushErr}</p>}
+          </div>
+
+          {/* ── TICKET CARDS ── */}
+          <p className="text-slate-500 text-xs uppercase tracking-widest">Generated tickets ({data.length})</p>
+          {data.map((ticket, i) => {
+            const pushed = pushResult?.created.find(c => c.title === ticket.jiraTitle)
+            return (
+              <div key={i} className={`bg-slate-900 border rounded-xl p-5 transition-all ${pushed ? 'border-emerald-500/40' : 'border-slate-800'}`}>
+                <div className="flex items-start justify-between gap-3 mb-4 flex-wrap">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {pushed && (
+                      <a href={pushed.url} target="_blank" rel="noopener noreferrer"
+                        className="text-xs bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 px-2 py-0.5 rounded font-mono font-bold hover:text-emerald-300">
+                        {pushed.key} ↗
+                      </a>
+                    )}
+                    <h3 className="text-white font-bold">{ticket.jiraTitle}</h3>
+                  </div>
+                  <div className="flex gap-2 shrink-0">
+                    <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-1 rounded">{ticket.type}</span>
+                    <span className={`text-xs font-bold px-2 py-1 rounded border ${SEV[ticket.severity] ?? SEV.medium}`}>{ticket.severity}</span>
+                  </div>
+                </div>
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div>
+                    <p className="text-slate-500 text-xs mb-2 uppercase tracking-widest">Steps to Reproduce</p>
+                    <ol className="space-y-1">
+                      {ticket.stepsToReproduce?.map((step, j) => (
+                        <li key={j} className="text-slate-300 text-sm flex gap-2">
+                          <span className="text-slate-600 shrink-0">{j + 1}.</span>{step}
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                  <div className="space-y-3">
+                    <div><p className="text-slate-500 text-xs mb-1">Expected</p><p className="text-emerald-400 text-sm">{ticket.expectedBehaviour}</p></div>
+                    <div><p className="text-slate-500 text-xs mb-1">Actual</p><p className="text-red-400 text-sm">{ticket.actualBehaviour}</p></div>
+                    <div><p className="text-slate-500 text-xs mb-1">Suggested Fix</p><p className="text-slate-300 text-sm">{ticket.suggestedFix}</p></div>
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {ticket.labels?.map((l, j) => <span key={j} className="text-xs bg-slate-800 text-slate-400 px-2 py-1 rounded-full">{l}</span>)}
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )
     }
@@ -326,6 +494,18 @@ export default function AnalyzePage() {
       <div className="bg-slate-800 rounded-xl p-4 max-h-64 overflow-y-auto">
         <p className="text-slate-500 text-xs mb-2">Raw output (could not parse structured data)</p>
         <pre className="text-slate-300 text-xs font-mono whitespace-pre-wrap">{tokens}</pre>
+      </div>
+    )
+  }
+
+  function JiraField({ label, value, onChange, placeholder, type = 'text' }: {
+    label: string; value: string; onChange: (v: string) => void; placeholder: string; type?: string
+  }) {
+    return (
+      <div>
+        <label className="text-slate-400 text-xs mb-1 block">{label}</label>
+        <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+          className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-blue-500 transition-colors" />
       </div>
     )
   }
