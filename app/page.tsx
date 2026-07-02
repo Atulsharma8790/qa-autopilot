@@ -157,7 +157,6 @@ export default function Home() {
           </button>
         </form>
         <p className="text-center text-slate-600 text-xs mt-4">
-          Built by <a href="https://atulsharma8790.github.io" className="text-slate-500 hover:text-slate-300">Atul Sharma</a>
         </p>
       </div>
     </div>
