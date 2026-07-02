@@ -158,8 +158,8 @@ export default function AnalyzePage() {
 
             if (data.type === 'step_start') {
               setActiveStep(data.step)
-              // Always auto-advance to the newly active step — clear any user pin
-              setPinnedTab(null)
+              // pinnedTab === null means "follow active" — keeps auto-advancing
+              // If user pinned a completed step, leave them there; don't yank away
             }
 
             if (data.type === 'token') {
