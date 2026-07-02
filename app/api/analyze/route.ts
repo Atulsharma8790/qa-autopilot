@@ -10,86 +10,44 @@ function send(controller: ReadableStreamDefaultController, data: object) {
   controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`))
 }
 
-/** Robustly extract an array from a JSON chunk — handles wrapped objects too */
 function extractArray(chunk: string): unknown[] | null {
-  // Try direct array first
   const arrMatch = chunk.match(/\[[\s\S]*\]/)
   if (arrMatch) {
-    try {
-      const parsed = JSON.parse(arrMatch[0])
-      if (Array.isArray(parsed)) return parsed
-    } catch { /* continue */ }
+    try { const p = JSON.parse(arrMatch[0]); if (Array.isArray(p)) return p } catch { /* */ }
   }
-  // Try object with any array-valued key
   const objMatch = chunk.match(/\{[\s\S]*\}/)
   if (objMatch) {
     try {
-      const parsed = JSON.parse(objMatch[0])
-      if (parsed && typeof parsed === 'object') {
-        for (const val of Object.values(parsed)) {
-          if (Array.isArray(val)) return val
-        }
-      }
-    } catch { /* continue */ }
+      const p = JSON.parse(objMatch[0])
+      if (p && typeof p === 'object') for (const v of Object.values(p)) if (Array.isArray(v)) return v
+    } catch { /* */ }
   }
   return null
 }
 
-/** Robustly extract an object from a JSON chunk */
 function extractObject(chunk: string): Record<string, unknown> | null {
   const objMatch = chunk.match(/\{[\s\S]*\}/)
   if (objMatch) {
-    try {
-      const parsed = JSON.parse(objMatch[0])
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
-    } catch { /* continue */ }
+    try { const p = JSON.parse(objMatch[0]); if (p && !Array.isArray(p)) return p } catch { /* */ }
   }
   return null
 }
 
-function parseSteps(text: string): Record<string, unknown> {
-  const result: Record<string, unknown> = {}
-  const stepKeys = ['STEP_1', 'STEP_2', 'STEP_3', 'STEP_4', 'STEP_5']
-
-  for (let i = 0; i < stepKeys.length; i++) {
-    const startMarker = `${stepKeys[i]}_START`
-    const nextMarker  = i < stepKeys.length - 1 ? `${stepKeys[i + 1]}_START` : null
-
-    const startIdx = text.indexOf(startMarker)
-    if (startIdx === -1) continue
-
-    const chunk = nextMarker && text.indexOf(nextMarker) !== -1
-      ? text.slice(startIdx + startMarker.length, text.indexOf(nextMarker))
-      : text.slice(startIdx + startMarker.length)
-
-    const key = `step${i + 1}`
-
-    if (i < 4) {
-      // Steps 1–4 expect arrays
-      const arr = extractArray(chunk)
-      if (arr) { result[key] = arr; continue }
-    }
-    // Step 5 (or fallback) expects an object
-    const obj = extractObject(chunk)
-    if (obj) result[key] = obj
-  }
-
-  return result
+function parseStepChunk(chunk: string, stepIndex: number): unknown {
+  if (stepIndex < 4) return extractArray(chunk) ?? { raw: chunk.trim().slice(0, 300) }
+  return extractObject(chunk) ?? { raw: chunk.trim().slice(0, 300) }
 }
 
 export async function POST(req: Request) {
   const { failures } = await req.json()
-  if (!failures?.trim()) {
-    return new Response('No failures provided', { status: 400 })
-  }
+  if (!failures?.trim()) return new Response('No failures provided', { status: 400 })
 
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        send(controller, { type: 'status', step: 0, message: 'Starting QA Autopilot loop...' })
-
         let fullText = ''
         let currentStep = 0
+        let stepStartIdx: Record<number, number> = {}
 
         const anthropicStream = await client.messages.stream({
           model: 'claude-sonnet-4-6',
@@ -99,29 +57,47 @@ export async function POST(req: Request) {
         })
 
         for await (const chunk of anthropicStream) {
-          if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
-            const text = chunk.delta.text
-            fullText += text
+          if (chunk.type !== 'content_block_delta' || chunk.delta.type !== 'text_delta') continue
+          const text = chunk.delta.text
+          fullText += text
 
-            const stepMatch = fullText.match(/STEP_(\d)_START/g)
-            if (stepMatch) {
-              const stepNum = parseInt(stepMatch[stepMatch.length - 1].replace('STEP_', '').replace('_START', ''))
-              if (stepNum !== currentStep) {
-                currentStep = stepNum
+          // Detect new step markers
+          for (let s = 1; s <= 5; s++) {
+            const marker = `STEP_${s}_START`
+            if (fullText.includes(marker) && !stepStartIdx[s]) {
+              stepStartIdx[s] = fullText.indexOf(marker)
+
+              // When step N starts, we can emit the parsed result of step N-1
+              if (s > 1) {
+                const prevStep = s - 1
+                const prevStart = stepStartIdx[prevStep]
+                const prevChunk = fullText.slice(prevStart + `STEP_${prevStep}_START`.length, stepStartIdx[s])
+                const parsed = parseStepChunk(prevChunk, prevStep - 1)
+                send(controller, { type: 'step_result', step: prevStep, data: parsed })
+              }
+
+              if (s !== currentStep) {
+                currentStep = s
                 send(controller, { type: 'step_start', step: currentStep })
               }
             }
-
-            send(controller, { type: 'token', text })
           }
+
+          // Stream live tokens so the UI can show what's happening right now
+          send(controller, { type: 'token', text, step: currentStep })
         }
 
-        const steps = parseSteps(fullText)
-        send(controller, { type: 'complete', steps })
+        // Parse and emit the last step (step 5)
+        if (stepStartIdx[5]) {
+          const lastChunk = fullText.slice(stepStartIdx[5] + 'STEP_5_START'.length)
+          const parsed = parseStepChunk(lastChunk, 4)
+          send(controller, { type: 'step_result', step: 5, data: parsed })
+        }
+
+        send(controller, { type: 'complete' })
 
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : 'Unknown error'
-        send(controller, { type: 'error', message: msg })
+        send(controller, { type: 'error', message: e instanceof Error ? e.message : 'Unknown error' })
       } finally {
         controller.close()
       }
@@ -129,10 +105,6 @@ export async function POST(req: Request) {
   })
 
   return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    },
+    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' },
   })
 }
