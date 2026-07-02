@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 
-const PORTFOLIO_URL = 'https://atul-sharma-qa.vercel.app'
+const PORTFOLIO_URL = 'https://atulsharma.vercel.app'
 
 export default function PortfolioBar() {
   const searchParams = useSearchParams()
@@ -11,7 +11,7 @@ export default function PortfolioBar() {
   useEffect(() => {
     // Show back button if arrived via ?ref=portfolio OR referrer is the portfolio
     const refParam = searchParams.get('ref') === 'portfolio'
-    const refHeader = typeof document !== 'undefined' && document.referrer.includes('atul-sharma-qa.vercel.app')
+    const refHeader = typeof document !== 'undefined' && document.referrer.includes('atulsharma.vercel.app')
     setFromPortfolio(refParam || refHeader)
   }, [searchParams])
 
